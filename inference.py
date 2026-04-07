@@ -101,23 +101,25 @@ SYSTEM_PROMPT = (
 
 
 def build_prompt(obs) -> str:
-    rows      = obs.dirty_csv.strip().split("\n")
-    preview   = "\n".join(rows[:30])
-    truncated = len(rows) > 30
+    rows    = obs.dirty_csv.strip().split("\n")
+    header  = rows[0]                        # always keep header
+    data    = rows[1:]
+    preview = "\n".join([header] + data[:10])  # header + 10 data rows only
+    truncated = len(data) > 10
     last_err  = f"\nLast error: {obs.last_action_error}" if obs.last_action_error else ""
     return (
         f"Task: {obs.task_id}\n"
-        f"Schema: {obs.schema_hint}\n"
+        f"Schema: {obs.schema_hint[:300]}\n"      # cap schema to 300 chars
         f"Score: {obs.current_score:.4f} | Issues remaining: {obs.issues_remaining}\n"
         f"Step {obs.step_number}/{obs.max_steps}{last_err}\n"
-        f"\nCSV{' (first 30 rows)' if truncated else ''}:\n{preview}\n\n"
+        f"\nCSV{' (first 10 rows shown)' if truncated else ''}:\n{preview}\n\n"
         "Reply with ONE JSON action:\n"
-        '  {"command":"SET_VALUE",       "row_index":<int>, "column":"<name>", "value":"<str>"}\n'
+        '  {"command":"SET_VALUE",       "row_index":<int>, "column":"<col>", "value":"<str>"}\n'
         '  {"command":"DROP_ROW",        "row_index":<int>}\n'
-        '  {"command":"STANDARDIZE_COL", "column":"<name>"}\n'
-        '  {"command":"FILL_MISSING",    "column":"<name>", "fill_strategy":"mean|median|mode|drop"}\n'
+        '  {"command":"STANDARDIZE_COL", "column":"<col>"}\n'
+        '  {"command":"FILL_MISSING",    "column":"<col>", "fill_strategy":"mean|median|mode|drop"}\n'
         '  {"command":"DONE"}\n'
-        "row_index = integer in the leftmost column of the CSV. JSON only."
+        "JSON only. No explanation."
     )
 
 
@@ -140,16 +142,18 @@ def parse_action(raw: str) -> CleanAction:
     return CleanAction(command="DONE")
 
 
-def call_llm(client: OpenAI, messages: list) -> str:
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
-        max_tokens=150,   # actions are short; saves free-tier quota
-        temperature=0.1,
+async def call_llm_async(client: OpenAI, messages: list) -> str:
+    """Run blocking LLM call in a thread so we can do other things concurrently."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: (client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            max_tokens=150,
+            temperature=0.1,
+        ).choices[0].message.content or "").strip()
     )
-    return (response.choices[0].message.content or "").strip()
-
-
 # ── Episode loop ───────────────────────────────────────────────────────────────
 
 async def run_episode(env, client: OpenAI, task_id: str) -> dict:
@@ -176,7 +180,7 @@ async def run_episode(env, client: OpenAI, task_id: str) -> dict:
             messages.append({"role": "user", "content": build_prompt(obs)})
 
             try:
-                raw    = call_llm(client, messages)
+                raw = await call_llm_async(client, messages)
                 action = parse_action(raw)
                 messages.append({"role": "assistant", "content": raw})
             except Exception as exc:
@@ -186,8 +190,8 @@ async def run_episode(env, client: OpenAI, task_id: str) -> dict:
                 break
 
             # Keep only system + last 8 exchanges to stay inside free-tier context limits
-            if len(messages) > 17:
-                messages = [messages[0]] + messages[-16:]
+            if len(messages) > 5:
+                messages = [messages[0]] + messages[-4:]
 
             result = await env.step(action)
             obs    = result.observation
