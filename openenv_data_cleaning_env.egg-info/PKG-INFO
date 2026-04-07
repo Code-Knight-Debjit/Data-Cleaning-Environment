@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: openenv-data_cleaning_env
+Version: 0.1.0
+Summary: Data Cleaning Env environment for OpenEnv
+Requires-Python: >=3.10
+Requires-Dist: openenv-core
+Requires-Dist: pandas>=2.0
+Requires-Dist: numpy>=1.24
+Requires-Dist: fastapi
+Requires-Dist: uvicorn
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0.0; extra == "dev"

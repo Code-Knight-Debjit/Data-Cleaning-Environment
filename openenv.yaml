@@ -1,0 +1,151 @@
+# openenv.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Manifest for the Data Cleaning Pipeline OpenEnv environment.
+#
+# Field reference
+# ───────────────
+# Required by the CLI (serve / build / push / validate):
+#   spec_version  — always 1 for this generation of the spec
+#   name          — environment identifier used by the CLI and auto-discovery
+#   type          — "space" means it can be deployed as a Hugging Face Space
+#   runtime       — "fastapi" tells the server how to boot
+#   app           — Python import path to the FastAPI app object
+#   port          — port the server listens on inside the container
+#
+# Read by AutoEnv auto-discovery (openenv.auto._discovery):
+#   name          — maps to env_key after stripping the "_env" suffix
+#   description   — human-readable label shown in env listings
+#   spec_version  — stored in EnvironmentInfo for introspection
+#   action        — EXPLICIT override of the auto-inferred class name
+#   observation   — EXPLICIT override of the auto-inferred class name
+#
+# NOTE on action / observation overrides:
+#   Auto-discovery infers class names from the env name using PascalCase:
+#     "data_cleaning_env" → base "data_cleaning" → "CleanAction"
+#   Our actual class is named "CleanAction" (not "CleanAction"),
+#   so these fields MUST be set to avoid ImportError on AutoEnv.from_env().
+#
+# All other fields (tasks, reward, tags) are informational.  They are not
+# parsed by the current OpenEnv tooling but are preserved in
+# EnvironmentInfo.manifest and available to the web UI and external tools.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core deployment fields ────────────────────────────────────────────────────
+
+spec_version: 1
+name: data_cleaning_env
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+
+# ── Package metadata ──────────────────────────────────────────────────────────
+
+version: "1.0.0"
+
+description: >-
+  Data cleaning pipeline: the agent receives a dirty CSV and must detect
+  and fix type errors, missing values, outliers, and schema inconsistencies
+  to match a hidden ground-truth dataset. Three tasks (easy → medium → hard)
+  with a deterministic grader that returns a continuous score in [0.0, 1.0].
+
+# ── Auto-discovery class overrides ───────────────────────────────────────────
+# These override auto-inferred names (which would be CleanAction /
+# CleanAction) to match the actual class names defined in models.py.
+
+action: CleanAction
+observation: CleanObservation
+
+# The client class is correctly inferred as DataCleaningEnv (data_cleaning →
+# DataCleaning + Env), which matches client.py, so no override is needed.
+
+# ── Tags (informational) ──────────────────────────────────────────────────────
+
+tags:
+  - data-cleaning
+  - tabular
+  - real-world
+  - hackathon
+
+# ── Task manifest (informational) ─────────────────────────────────────────────
+# One entry per task. These values mirror the constants in models.py
+# (MAX_STEPS, DONE_THRESHOLD) and the descriptions in dataset_factory.py.
+
+tasks:
+  - id: easy
+    name: Fix obvious errors
+    description: >-
+      50-row sales CSV with 29 injected dirty cells: 10 type mismatches
+      (text in numeric columns), 8 missing values, 5 far-future dates
+      (year 2099), and 6 cells with leading/trailing whitespace.
+      Graded by exact cell-level match against the ground truth (0.0–1.0).
+    dataset_rows: 50
+    dirty_cells: 29
+    max_steps: 40
+    done_threshold: 0.95
+
+  - id: medium
+    name: Outlier detection without false positives
+    description: >-
+      200-row customer transaction CSV with 15 true statistical outliers
+      (negative or > $2000 amounts) that must be fixed or removed, 5 valid
+      large transactions ($900–$2000) that must NOT be removed, and 12
+      category spelling typos. Graded by F1 score on outlier detection
+      (0.5 weight) and typo correction rate (0.5 weight).
+    dataset_rows: 200
+    dirty_cells: 27
+    max_steps: 80
+    done_threshold: 0.85
+
+  - id: hard
+    name: Multi-source schema normalisation and deduplication
+    description: >-
+      430-row CSV (400 clean + 30 duplicates) merged from 3 fictional data
+      sources with inconsistent column naming (e.g. cust_id / customer_id /
+      CustomerID), mixed date formats (ISO, US, EU), and ~30 duplicate rows
+      (exact and near-duplicate). Agent must infer the canonical 9-column
+      schema without explicit documentation. Graded by schema match (40%),
+      deduplication F1 (35%), and date format compliance (25%).
+    dataset_rows: 430
+    canonical_rows: 400
+    canonical_columns: 9
+    duplicate_rows: 30
+    max_steps: 150
+    done_threshold: 0.80
+
+# ── Reward function summary (informational) ───────────────────────────────────
+
+reward:
+  type: dense
+  range: [-0.5, 1.0]
+  step_cost: -0.005
+  components:
+    - name: progress
+      weight: primary
+      description: >-
+        Grader score delta each step (curr_score − prev_score).
+        The main learning signal — any cell fixed produces a non-zero reward.
+
+    - name: efficiency_bonus
+      weight: "+0.10 × (1 − step_fraction)"
+      description: >-
+        Small bonus awarded the step the episode is solved (score crosses
+        done_threshold). Rewards finishing early relative to the step budget.
+
+    - name: false_positive_penalty
+      weight: -0.15
+      description: >-
+        Applied when DROP_ROW removes a valid-extreme row in the medium task.
+        Penalises aggressive deletion without checking schema_hint.
+
+    - name: early_done_penalty
+      weight: -0.20
+      description: >-
+        Applied when the agent sends DONE with current_score < 0.60.
+        Discourages giving up prematurely.
+
+    - name: step_cost
+      weight: -0.005
+      description: >-
+        Fixed cost every step regardless of outcome.
+        Prevents infinite loops and padding.

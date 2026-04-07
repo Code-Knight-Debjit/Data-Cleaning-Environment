@@ -1,0 +1,9 @@
+openenv-core
+pandas>=2.0
+numpy>=1.24
+fastapi
+uvicorn
+
+[dev]
+pytest>=8.0.0
+pytest-cov>=4.0.0
