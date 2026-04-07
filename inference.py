@@ -23,7 +23,8 @@ import os
 import re
 import sys
 from typing import List, Optional
-
+from unittest import result
+from client import DataCleaningEnvClient, CleanAction, CleanObservation
 from openai import OpenAI
 
 # ── Environment client imports ────────────────────────────────────────────────
@@ -234,7 +235,9 @@ async def main() -> None:
     print(f"LOCAL_IMAGE_NAME : {LOCAL_IMAGE_NAME or '(not set — using ENV_BASE_URL)'}", flush=True)
     print(f"ENV_BASE_URL     : {ENV_BASE_URL}",  flush=True)
     print("", flush=True)
-
+    action = CleanAction(command="drop_column", column="some_col")
+    result = await env.step(action)
+    obs: CleanObservation = result.observation
     llm = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
     if LOCAL_IMAGE_NAME:

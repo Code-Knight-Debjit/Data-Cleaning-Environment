@@ -5,10 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 """Data Cleaning Env Environment Client."""
-
+from pydantic import BaseModel
 from typing import Dict
 
-from openenv.core import EnvClient
+from openenv.core import EnvClient, Action, Observation
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
@@ -17,6 +17,25 @@ try:
 except ImportError:
     from models import CleanAction, CleanObservation
 
+
+# ✅ ACTION model — what the agent sends TO the environment
+class CleanAction(Action):
+    command: str          # e.g. "drop_column", "fill_missing", "rename_column"
+    column: str | None = None
+    value: str | None = None
+
+# ✅ OBSERVATION model — what the environment sends BACK to the agent
+class CleanObservation(Observation):
+    echoed_message: str = ""
+    message_length: int = 0
+    done: bool = False
+    reward: float | None = None
+    metadata: dict = {}
+
+class DataCleaningEnvClient(EnvClient[CleanAction, CleanObservation]):
+    def _parse_result(self, data: dict) -> CleanObservation:
+        # ✅ Parse into Observation, NOT CleanAction
+        return CleanObservation(**data)
 
 class DataCleaningEnv(
     EnvClient[CleanAction, CleanObservation, State]
