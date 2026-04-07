@@ -24,7 +24,7 @@ import re
 import sys
 from typing import List, Optional
 from unittest import result
-from client import DataCleaningEnvClient, CleanAction, CleanObservation
+from client import DataCleaningEnv, CleanAction, CleanObservation
 from openai import OpenAI
 
 # ── Environment client imports ────────────────────────────────────────────────
@@ -42,7 +42,7 @@ except ImportError:
 API_BASE_URL     = os.getenv("API_BASE_URL",     "https://router.huggingface.co/v1")
 MODEL_NAME       = os.getenv("MODEL_NAME",       "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN         = os.getenv("HF_TOKEN",         "")
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "openenv-data_cleaning:latest")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "")
 ENV_BASE_URL     = os.getenv("ENV_BASE_URL",     "http://localhost:8000")
 
 BENCHMARK  = "data_cleaning_env"
@@ -235,9 +235,8 @@ async def main() -> None:
     print(f"LOCAL_IMAGE_NAME : {LOCAL_IMAGE_NAME or '(not set — using ENV_BASE_URL)'}", flush=True)
     print(f"ENV_BASE_URL     : {ENV_BASE_URL}",  flush=True)
     print("", flush=True)
-    action = CleanAction(command="drop_column", column="some_col")
-    result = await env.step(action)
-    obs: CleanObservation = result.observation
+
+    # ✅ Create llm and env in the correct order
     llm = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
     if LOCAL_IMAGE_NAME:
