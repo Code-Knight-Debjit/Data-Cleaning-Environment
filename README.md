@@ -1,3 +1,11 @@
+---
+title: Data Cleaning Environment
+emoji: 🧹
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+---
 <div align="center">
 
 # 🧹 Data Cleaning Environment
