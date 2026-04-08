@@ -199,6 +199,7 @@ class DataCleaningEnvironment(Environment):
             last_action_success=True,
             last_action_error=None,
             grader_result=initial_result,
+            column_status=self._compute_column_status(),
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -227,29 +228,65 @@ class DataCleaningEnvironment(Environment):
         prev_score = self._state.current_score
         self._state.previous_score = prev_score
 
-        # ── DONE shortcut ────────────────────────────────────────────────────
+        # ── DONE handling ────────────────────────────────────────────────────
+        # The environment decides termination — not the agent.
+        # DONE is only accepted when score >= task threshold.
+        # Below threshold: penalise heavily, refuse to terminate.
         if action.command == "DONE":
-            reward = self._compute_reward(
-                action=action,
-                prev_score=prev_score,
-                curr_score=prev_score,   # score doesn't change on DONE
-                action_success=True,
-                was_false_positive=False,
-            )
-            done = True
-            self._state.dirty_csv_snapshot = self._df_to_csv(self._dirty_df)
-            return self._build_observation(
-                reward=reward,
-                done=done,
-                last_action_success=True,
-                last_action_error=None,
-                grader_result=GradeResult(
-                    score=prev_score,
-                    issues_remaining=self._state.initial_dirty_cells
-                        - int(prev_score * self._state.initial_dirty_cells),
-                    detail="Agent signalled DONE.",
-                ),
-            )
+            threshold = DONE_THRESHOLD[self._state.task_id]
+
+            if self._state.current_score >= threshold:
+                # Legitimate DONE — episode ends with efficiency bonus
+                reward = self._compute_reward(
+                    action=action,
+                    prev_score=prev_score,
+                    curr_score=prev_score,
+                    action_success=True,
+                    was_false_positive=False,
+                )
+                done = True
+                self._state.dirty_csv_snapshot = self._df_to_csv(self._dirty_df)
+                col_status = self._compute_column_status()
+                return self._build_observation(
+                    reward=reward,
+                    done=done,
+                    last_action_success=True,
+                    last_action_error=None,
+                    grader_result=GradeResult(
+                        score=prev_score,
+                        issues_remaining=0,
+                        detail="Agent signalled DONE — accepted.",
+                    ),
+                    column_status=col_status,
+                )
+            else:
+                # Premature DONE — refuse termination, apply strong penalty
+                col_status = self._compute_column_status()
+                still_broken = [
+                    c for c, s in col_status.items()
+                    if s.get("missing", 0) > 0 or not s.get("standardized", True)
+                ]
+                error_msg = (
+                    f"DONE rejected: score {self._state.current_score:.4f} < "
+                    f"required {threshold:.2f}. "
+                    f"Still broken: {still_broken[:5]}"
+                )
+                # Hard penalty: -1.0 clamped to floor
+                reward = round(float(np.clip(-1.0 + STEP_COST, -1.0, 1.0)), 4)
+                self._state.dirty_csv_snapshot = self._df_to_csv(self._dirty_df)
+                return self._build_observation(
+                    reward=reward,
+                    done=False,          # episode continues
+                    last_action_success=False,
+                    last_action_error=error_msg,
+                    grader_result=GradeResult(
+                        score=self._state.current_score,
+                        issues_remaining=self._state.initial_dirty_cells
+                            - int(self._state.current_score * self._state.initial_dirty_cells),
+                        detail="Premature DONE blocked.",
+                    ),
+                    column_status=col_status,
+                )
 
         # ── Apply action to _dirty_df ────────────────────────────────────────
         action_success, error_msg, was_false_positive = self._apply_action(action)
@@ -289,6 +326,7 @@ class DataCleaningEnvironment(Environment):
             last_action_success=action_success,
             last_action_error=error_msg,
             grader_result=grader_result,
+            column_status=self._compute_column_status(),
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -623,6 +661,89 @@ class DataCleaningEnvironment(Environment):
         return round(float(np.clip(reward, -0.5, 1.0)), 4)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Column status (for observation + DONE guard)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _compute_column_status(self) -> dict:
+        """
+        Return a per-column health summary.
+
+        Format::
+            {
+              "price":      {"missing": 0, "standardized": True,  "issues": []},
+              "order_date": {"missing": 0, "standardized": False, "issues": ["bad_date_format"]},
+            }
+
+        Rules
+        -----
+        missing       — count of NaN / None / empty-string values
+        standardized  — True when the column has no detectable type/format errors
+        issues        — human-readable list of problem types found
+
+        Used by:
+          - The DONE hard-block (DONE rejected if any col has missing>0 or standardized=False)
+          - The observation (agent reads this directly to plan its next action)
+        """
+        if self._dirty_df is None:
+            return {}
+
+        df = self._dirty_df
+        status: dict = {}
+
+        for col in df.columns:
+            series   = df[col]
+            issues   = []
+
+            # ── Missing count ──────────────────────────────────────────────
+            missing = int(series.apply(_is_nan).sum())
+            if missing > 0:
+                issues.append(f"{missing}_missing")
+
+            raw = series.dropna().astype(object).apply(str)
+
+            # ── Date column checks ─────────────────────────────────────────
+            if "date" in col.lower():
+                import re
+                iso_pat = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+                bad_dates = raw.apply(
+                    lambda x: not iso_pat.match(x.strip())
+                ).sum()
+                if bad_dates > 0:
+                    issues.append(f"{int(bad_dates)}_bad_date_format")
+                # Far-future years are a known injection pattern (year > 2030)
+                def _bad_year(s: str) -> bool:
+                    try:
+                        return int(s[:4]) > 2030
+                    except Exception:
+                        return False
+                future = raw.apply(lambda x: _bad_year(x.strip())).sum()
+                if future > 0:
+                    issues.append(f"{int(future)}_future_year")
+
+            # ── Numeric column checks ──────────────────────────────────────
+            elif self._looks_like_numeric_column(col, series):
+                non_numeric = pd.to_numeric(raw, errors="coerce").isna().sum()
+                if non_numeric > 0:
+                    issues.append(f"{int(non_numeric)}_non_numeric_text")
+
+            # ── String column checks ───────────────────────────────────────
+            else:
+                whitespace = raw.apply(
+                    lambda x: x != x.strip()
+                ).sum()
+                if whitespace > 0:
+                    issues.append(f"{int(whitespace)}_has_whitespace")
+
+            standardized = len(issues) == 0 and missing == 0
+            status[col] = {
+                "missing":      missing,
+                "standardized": standardized,
+                "issues":       issues,
+            }
+
+        return status
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Observation builder
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -633,6 +754,7 @@ class DataCleaningEnvironment(Environment):
         last_action_success: bool,
         last_action_error: Optional[str],
         grader_result: GradeResult,
+        column_status: Optional[dict] = None,
     ) -> CleanObservation:
         if self._state is None:
             raise RuntimeError("State not initialised.")
@@ -654,6 +776,8 @@ class DataCleaningEnvironment(Environment):
             # Last-action feedback
             last_action_success=last_action_success,
             last_action_error=last_action_error,
+            # Per-column status
+            column_status=column_status or {},
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -817,10 +941,23 @@ if __name__ == "__main__":
                   f"score={obs4.current_score:.4f}  reward={obs4.reward:.4f}")
 
         # ── DONE action ───────────────────────────────────────────────────────
+        # DONE below threshold is now BLOCKED — done=False, reward=-1.0, error set
         done_obs = env.step(CleanAction(command="DONE"))
-        assert done_obs.done is True
-        print(f"step (DONE)    → done={done_obs.done}  "
-              f"reward={done_obs.reward:.4f}  score={done_obs.current_score:.4f}")
+        threshold = DONE_THRESHOLD[task_id]
+        if env.state.current_score >= threshold:
+            # Score met threshold — DONE accepted
+            assert done_obs.done is True, f"Expected done=True at score {env.state.current_score:.4f}"
+            print(f"step (DONE, accepted) → done={done_obs.done}  "
+                  f"reward={done_obs.reward:.4f}  score={done_obs.current_score:.4f}")
+        else:
+            # Score below threshold — DONE blocked
+            assert done_obs.done is False, \
+                f"Expected done=False (premature DONE blocked) at score {done_obs.current_score:.4f}"
+            assert done_obs.last_action_success is False
+            assert done_obs.reward == round(float(np.clip(-1.0 + STEP_COST, -1.0, 1.0)), 4)
+            print(f"step (DONE, blocked)  → done={done_obs.done}  "
+                  f"reward={done_obs.reward:.4f}  score={done_obs.current_score:.4f}")
+            print(f"  error: {done_obs.last_action_error[:80]}")
 
         env.close()
 

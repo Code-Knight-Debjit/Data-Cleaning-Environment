@@ -278,6 +278,20 @@ class CleanObservation(Observation):
         ),
     )
 
+    # ── Per-column status ────────────────────────────────────────────────────
+
+    column_status: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Per-column health summary so the agent can see exactly what is "
+            "still broken without parsing the CSV manually. "
+            "Format: {col_name: {missing: int, standardized: bool, issues: [str]}}. "
+            "A column is 'standardized' when it has no type errors, no bad dates, "
+            "and no text values in numeric columns. "
+            "DONE is only valid when every column shows missing=0 and standardized=true."
+        ),
+    )
+
     @field_validator("current_score")
     @classmethod
     def _round_score(cls, v: float) -> float:
@@ -460,4 +474,4 @@ if __name__ == "__main__":
     print("\n── JSON schemas ──────────────────────────────────────────────")
     print("Action schema keys:     ", list(CleanAction.model_json_schema()["properties"].keys()))
     print("Observation schema keys:", list(CleanObservation.model_json_schema()["properties"].keys()))
-    print("State schema keys:      ", list(CleanState.model_json_schema()["properties"].keys()))    
+    print("State schema keys:      ", list(CleanState.model_json_schema()["properties"].keys()))
