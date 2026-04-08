@@ -305,7 +305,11 @@ async def main() -> None:
 
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    env = await DataCleaningEnv.from_docker_image(LOCAL_IMAGE_NAME)
+    if os.getenv("SPACE_ID"):   # Running inside HF Space
+        env = DataCleaningEnv(base_url="http://localhost:7860")
+        await env.connect()
+    else:
+        env = await DataCleaningEnv.from_docker_image(LOCAL_IMAGE_NAME)
 
     results = []
     try:
