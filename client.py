@@ -21,7 +21,7 @@ Usage (async)
     from data_cleaning_env.models import CleanAction
 
     async def main():
-        async with DataCleaningEnv(base_url="http://localhost:8000") as env:
+        async with DataCleaningEnv(base_url="http://localhost:7860") as env:
             result = await env.reset(task_id="easy")
             print(result.observation.schema_hint)
 
@@ -34,7 +34,7 @@ Usage (async)
 
 Usage (sync wrapper)
 --------------------
-    env = DataCleaningEnv(base_url="http://localhost:8000").sync()
+    env = DataCleaningEnv(base_url="http://localhost:7860").sync()
     with env:
         result = env.reset(task_id="medium")
         result = env.fill_missing(column="amount", fill_strategy="median")
@@ -52,6 +52,7 @@ try:
 except ImportError:
     from openenv.core.client_types import StepResult  # type: ignore[no-redef]
     from openenv.core.env_client import EnvClient     # type: ignore[no-redef]
+#7860
 
 # ── Local model imports (try relative then absolute) ──────────────────────────
 try:
@@ -83,14 +84,14 @@ class DataCleaningEnv(EnvClient[CleanAction, CleanObservation, CleanState]):
     All methods are async. For synchronous use, call ``.sync()`` to get a
     ``SyncEnvClient`` wrapper:
 
-        with DataCleaningEnv(base_url="http://localhost:8000").sync() as env:
+        with DataCleaningEnv(base_url="http://localhost:7860").sync() as env:
             result = env.reset(task_id="easy")
             result = env.set_value(row_index=0, column="price", value="9.99")
 
     Connecting to different backends
     ---------------------------------
     Local dev server (after ``openenv serve``):
-        env = DataCleaningEnv(base_url="http://localhost:8000")
+        env = DataCleaningEnv(base_url="http://localhost:7860")
 
     Local Docker image (after ``openenv build``):
         env = await DataCleaningEnv.from_docker_image("data-cleaning-env:latest")
