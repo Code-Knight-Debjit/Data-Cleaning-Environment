@@ -91,7 +91,8 @@ SYSTEM_PROMPT = textwrap.dedent("""
 """).strip()
 
 
-def build_user_prompt(obs) -> str:
+def build_user_prompt(obs, history: List[str]) -> str:
+    history_block = "\n".join(history[-15:]) if history else "None yet."
     return textwrap.dedent(f"""
         Task: {obs.task_id}
         Schema hint: {obs.schema_hint}
@@ -101,6 +102,16 @@ def build_user_prompt(obs) -> str:
         Initial dirty cells: {obs.initial_dirty_cells}
         Last action success: {obs.last_action_success}
         Last action error: {obs.last_action_error or 'none'}
+
+        === ACTION HISTORY (most recent 15) ===
+        {history_block}
+
+        IMPORTANT RULES:
+        - Do NOT repeat any action that already appears in the history with score_delta=0.0000.
+        - Do NOT repeat STANDARDIZE_COL or FILL_MISSING on the same column twice.
+        - If score is not improving after 2 steps, switch strategy entirely.
+        - Use SET_VALUE to fix specific bad cells (wrong types, "N/A" strings, outliers, future dates).
+        - Inspect the CSV carefully before choosing your action.
 
         Current CSV (first 80 rows shown if large):
         {_truncate_csv(obs.dirty_csv, max_rows=80)}
@@ -186,8 +197,8 @@ def _action_to_str(action: CleanAction) -> str:
 
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
-def get_model_action(client: OpenAI, obs) -> CleanAction:
-    user_prompt = build_user_prompt(obs)
+def get_model_action(client: OpenAI, obs, history: List[str]) -> CleanAction:
+    user_prompt = build_user_prompt(obs, history)
     try:
         completion = client.chat.completions.create(
             model=MODEL_NAME,
@@ -203,8 +214,7 @@ def get_model_action(client: OpenAI, obs) -> CleanAction:
         return parse_action(text)
     except Exception as exc:
         print(f"[DEBUG] Model/parse error: {exc}", flush=True)
-        # Safe fallback: fill missing values in whatever the first column is
-        return CleanAction(command="FILL_MISSING", column="price", fill_strategy="median")
+        return CleanAction(command="FILL_MISSING", column="quantity", fill_strategy="median")
 
 # ── Episode runner ────────────────────────────────────────────────────────────
 
@@ -217,8 +227,10 @@ async def run_episode(env: DataCleaningEnv, client: OpenAI, task_id: str) -> dic
     threshold  = cfg["threshold"]
 
     rewards:      List[float] = []
+    history:      List[str]   = []   # action history fed back to LLM each step
     steps_taken:  int         = 0
     score:        float       = 0.0
+    prev_score:   float       = 0.0
     success:      bool        = False
 
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
@@ -226,26 +238,39 @@ async def run_episode(env: DataCleaningEnv, client: OpenAI, task_id: str) -> dic
     try:
         result    = await env.reset(task_id=task_id)
         obs       = result.observation
+        prev_score = obs.current_score
 
         for step in range(1, max_steps + 1):
             if result.done:
                 break
 
-            action = get_model_action(client, obs)
+            action = get_model_action(client, obs, history)
 
             result = await env.step(action)
             obs    = result.observation
 
-            reward = result.reward or 0.0
-            done   = result.done
-            error  = obs.last_action_error if not obs.last_action_success else None
+            reward      = result.reward or 0.0
+            done        = result.done
+            error       = obs.last_action_error if not obs.last_action_success else None
+            score_delta = obs.current_score - prev_score
+            prev_score  = obs.current_score
 
             rewards.append(reward)
             steps_taken = step
 
+            # Build a rich history entry the LLM can learn from
+            action_desc = _action_to_str(action)
+            status      = "✓" if obs.last_action_success else "✗"
+            delta_str   = f"+{score_delta:.4f}" if score_delta > 0 else f"{score_delta:.4f}"
+            history.append(
+                f"step={step} {status} {action_desc} reward={reward:+.2f} "
+                f"score_delta={delta_str} score={obs.current_score:.4f}"
+                + (f" ERROR={error}" if error else "")
+            )
+
             log_step(
                 step=step,
-                action=_action_to_str(action),
+                action=action_desc,
                 reward=reward,
                 done=done,
                 error=error,
