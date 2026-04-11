@@ -1,336 +1,437 @@
 """
-Inference Script — Data Cleaning Environment
-=============================================
-MANDATORY environment variables:
-    API_BASE_URL       The API endpoint for the LLM.
-    MODEL_NAME         The model identifier to use for inference.
-    HF_TOKEN           Your Hugging Face / API key.
-    LOCAL_IMAGE_NAME   Docker image name (when using from_docker_image()).
+inference.py
+------------
+Official submission inference script for the Data Cleaning Pipeline environment.
 
-Defaults are set only for API_BASE_URL and MODEL_NAME (not HF_TOKEN).
+Environment variables:
+    API_BASE_URL   LLM endpoint.  Default: HuggingFace free router.
+    MODEL_NAME     Model to use.  Default: Qwen/Qwen2.5-72B-Instruct (free).
+    HF_TOKEN       Your HuggingFace token (hf_...).
+    ENV_BASE_URL   The running environment URL.
+                   Set this to your HuggingFace Space URL, e.g.:
+                   https://CodeKnightDebjit-data-cleaning-env.hf.space
 
-STDOUT FORMAT
-- [START] task=<task_name> env=<benchmark> model=<model_name>
-- [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
-- [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
+NOTE: Do NOT use LOCAL_IMAGE_NAME / from_docker_image() in submitted scripts.
+The evaluator machine does not have your local Docker image — it connects to
+your live HF Space via ENV_BASE_URL.
+
+STDOUT FORMAT (evaluator parses these exactly):
+    [START] task=<n> env=<benchmark> model=<model>
+    [STEP]  step=<n> action=<str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<0.00> rewards=<r1,r2,...>
 """
 
 import asyncio
 import json
 import os
 import re
-import textwrap
-from typing import List, Optional
+import sys
+from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 
-from client import DataCleaningEnv
-from models import CleanAction
+try:
+    from client import DataCleaningEnv
+    from models import CleanAction, MAX_STEPS, DONE_THRESHOLD
+except ImportError:
+    sys.path.insert(0, os.path.dirname(__file__))
+    from client import DataCleaningEnv
+    from models import CleanAction, MAX_STEPS, DONE_THRESHOLD
 
-# ── Environment variables ────────────────────────────────────────────────────
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "openenv-data_cleaning:latest")
-API_KEY          = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL     = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME       = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
-BENCHMARK        = "data_cleaning_env"
 
-# ── Per-task config (mirrors server constants) ────────────────────────────────
-TASK_CONFIG = {
-    "easy":   {"max_steps": 40,  "threshold": 0.95},
-    "medium": {"max_steps": 80,  "threshold": 0.85},
-    "hard":   {"max_steps": 150, "threshold": 0.80},
-}
+# ── Configuration ──────────────────────────────────────────────────────────────
+# ENV_BASE_URL must point to your live HuggingFace Space.
+# The evaluator sets this automatically when it runs your script.
 
-TEMPERATURE = 0.2   # low temp → more deterministic action parsing
-MAX_TOKENS  = 256
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN     = os.getenv("HF_TOKEN",     "")
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://CodeKnightDebjit-data-cleaning-env.hf.space")
 
-# ── Logging helpers (strict stdout format) ───────────────────────────────────
+BENCHMARK   = "data_cleaning_env"
+TASK_IDS    = ["easy", "medium", "hard"]
+STEP_LIMITS = {"easy": 25, "medium": 50, "hard": 80}
+
+
+# ── System prompt ──────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are a deterministic data cleaning agent.
+Your task is to clean a dataset step-by-step using valid actions.
+You are operating inside an environment with strict rules.
+--------------------------------------------------
+## INPUT PROVIDED EACH STEP
+You will receive:
+1. Column schema (LIST OF VALID COLUMN NAMES — CASE SENSITIVE)
+2. Column status:
+   - missing values count
+   - whether standardized (true/false)
+3. Remaining issues (global state)
+4. Previous actions taken
+--------------------------------------------------
+## OBJECTIVE
+Fully clean the dataset with MINIMUM steps.
+A dataset is CLEAN only if:
+- No missing values remain
+- All columns are standardized
+- No invalid formats exist
+--------------------------------------------------
+## STRICT RULES (MUST FOLLOW)
+### 1. NEVER TERMINATE EARLY
+You MUST NOT output DONE unless:
+- ALL columns have missing = 0
+- ALL columns have standardized = true
+- remaining_issues is empty
+If ANY issue remains → DO NOT output DONE.
+--------------------------------------------------
+### 2. USE ONLY VALID COLUMNS
+- You MUST use EXACT column names from schema
+- Column names are CASE SENSITIVE
+- NEVER invent new column names
+--------------------------------------------------
+### 3. PRIORITIZE COLUMN-LEVEL ACTIONS
+Preferred actions:
+- FILL_MISSING (fixes entire column)
+- STANDARDIZE_COL (fixes formatting)
+Avoid:
+- SET_VALUE (only for single isolated errors)
+NEVER fix a full column using repeated SET_VALUE.
+--------------------------------------------------
+### 4. DO NOT REPEAT ACTIONS
+- Do NOT apply the same action repeatedly on the same column
+- Do NOT standardize an already standardized column
+- Do NOT fill missing if missing = 0
+--------------------------------------------------
+### 5. AVOID DESTRUCTIVE ACTIONS
+- DROP_ROW should be used ONLY when absolutely necessary
+--------------------------------------------------
+## OUTPUT FORMAT (STRICT JSON ONLY)
+Return ONLY one of these — no explanation, no markdown:
+{"action": "FILL_MISSING", "column": "<col>", "strategy": "<mean|median|mode>"}
+{"action": "STANDARDIZE_COL", "column": "<col>"}
+{"action": "SET_VALUE", "column": "<col>", "row": <int>, "value": "<str>"}
+{"action": "DROP_ROW", "row": <int>}
+{"action": "DONE"}
+--------------------------------------------------
+## FAILURE CONDITIONS (AVOID THESE)
+- DONE prematurely → penalty -1.0
+- Invalid column names → action fails
+- Repeated same action → wasted step
+--------------------------------------------------
+Every step must move the dataset closer to a fully clean state."""
+
+
+# ── Official log format ────────────────────────────────────────────────────────
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
-def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+def log_step(step: int, action: str, reward: float, done: bool,
+             error: Optional[str]) -> None:
     error_val = error if error else "null"
-    done_val  = str(done).lower()
     print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        f"[STEP] step={step} action={action[:80].replace(chr(10), ' ')} "
+        f"reward={reward:.2f} done={str(done).lower()} error={error_val}",
         flush=True,
     )
 
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(success: bool, steps: int, score: float,
+            rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} "
+        f"score={score:.2f} rewards={rewards_str}",
         flush=True,
     )
 
-# ── Prompt builders ───────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = textwrap.dedent("""
-    You are an expert data cleaning agent. You receive a dirty CSV dataset and must
-    fix it step by step to match a hidden clean ground truth.
+# ── Prompt builder ─────────────────────────────────────────────────────────────
 
-    Available commands (respond with EXACTLY one JSON object, no extra text):
-
-    {"command": "SET_VALUE",       "row_index": <int>, "column": "<col>", "value": "<val>"}
-    {"command": "DROP_ROW",        "row_index": <int>}
-    {"command": "STANDARDIZE_COL", "column": "<col>"}
-    {"command": "FILL_MISSING",    "column": "<col>", "fill_strategy": "mean|median|mode|drop"}
-    {"command": "DONE"}
-
-    Rules:
-    - Output ONLY the JSON object — no explanation, no markdown, no backticks.
-    - Use DONE only when you are confident the score meets the task threshold.
-    - SET_VALUE fixes a single bad cell.
-    - STANDARDIZE_COL normalises an entire column's format.
-    - FILL_MISSING fills NaN values in a column.
-    - DROP_ROW removes a row; use carefully — false positives are penalised.
-    - Row indices are 0-based positional indices (they shift after each DROP_ROW).
-""").strip()
+def _col_status_block(column_status: Dict[str, Any]) -> str:
+    if not column_status:
+        return "  (not available)"
+    lines = []
+    for col, s in column_status.items():
+        missing      = s.get("missing", 0)
+        standardized = s.get("standardized", True)
+        issues       = s.get("issues", [])
+        flag         = "OK" if (missing == 0 and standardized) else "NEEDS_FIX"
+        issue_str    = ", ".join(issues) if issues else ""
+        lines.append(
+            f"  {col:<26} missing={missing:<3} standardized={str(standardized).lower():<5}"
+            + (f"  issues=[{issue_str}]" if issue_str else "")
+            + f"  → {flag}"
+        )
+    return "\n".join(lines)
 
 
 def build_user_prompt(obs, history: List[str]) -> str:
-    history_block = "\n".join(history[-15:]) if history else "None yet."
-    return textwrap.dedent(f"""
-        Task: {obs.task_id}
-        Schema hint: {obs.schema_hint}
-        Step: {obs.step_number} / {obs.max_steps}
-        Current score: {obs.current_score:.4f}
-        Issues remaining: {obs.issues_remaining}
-        Initial dirty cells: {obs.initial_dirty_cells}
-        Last action success: {obs.last_action_success}
-        Last action error: {obs.last_action_error or 'none'}
+    col_status: Dict[str, Any] = getattr(obs, "column_status", {})
+    valid_columns = list(col_status.keys())
+    broken = [c for c, s in col_status.items()
+              if s.get("missing", 0) > 0 or not s.get("standardized", True)]
 
-        === ACTION HISTORY (most recent 15) ===
-        {history_block}
+    rows    = obs.dirty_csv.strip().split("\n")
+    preview = "\n".join(rows[:21])
 
-        IMPORTANT RULES:
-        - Do NOT repeat any action that already appears in the history with score_delta=0.0000.
-        - Do NOT repeat STANDARDIZE_COL or FILL_MISSING on the same column twice.
-        - If score is not improving after 2 steps, switch strategy entirely.
-        - Use SET_VALUE to fix specific bad cells (wrong types, "N/A" strings, outliers, future dates).
-        - Inspect the CSV carefully before choosing your action.
+    all_clean = len(broken) == 0
+    done_hint = (
+        "ALL columns clean → you MAY output DONE"
+        if all_clean else
+        f"{len(broken)} column(s) still broken → DO NOT output DONE"
+    )
 
-        Current CSV (first 80 rows shown if large):
-        {_truncate_csv(obs.dirty_csv, max_rows=80)}
+    history_block = "\n".join(f"  {h}" for h in history[-6:]) if history else "  none"
 
-        Output your next CleanAction as a single JSON object.
-    """).strip()
+    return f"""--------------------------------------------------
+## COLUMN SCHEMA (EXACT CASE-SENSITIVE NAMES — USE THESE EXACTLY)
+{chr(10).join(f'  - {c}' for c in valid_columns)}
+
+--------------------------------------------------
+## COLUMN STATUS
+{_col_status_block(col_status)}
+
+--------------------------------------------------
+## GLOBAL STATE
+Task:             {obs.task_id}
+Step:             {obs.step_number} / {obs.max_steps}
+Score:            {obs.current_score:.4f}  (need >= {DONE_THRESHOLD[obs.task_id]:.2f})
+Remaining issues: {obs.issues_remaining}
+Broken columns:   {broken}
+DONE status:      {done_hint}
+
+--------------------------------------------------
+## SCHEMA HINT
+{obs.schema_hint}
+
+--------------------------------------------------
+## CSV PREVIEW (first 20 rows)
+{preview}
+
+--------------------------------------------------
+## PREVIOUS ACTIONS
+{history_block}
+
+--------------------------------------------------
+Return ONLY valid JSON — no explanation, no markdown."""
 
 
-def _truncate_csv(csv_text: str, max_rows: int = 80) -> str:
-    lines = csv_text.splitlines()
-    if len(lines) <= max_rows + 1:   # +1 for header
-        return csv_text
-    header = lines[0]
-    body   = lines[1: max_rows + 1]
-    omitted = len(lines) - 1 - max_rows
-    return "\n".join([header] + body + [f"... ({omitted} more rows omitted)"])
+# ── Action parsing ─────────────────────────────────────────────────────────────
 
-# ── Action parsing ────────────────────────────────────────────────────────────
+COMMAND_MAP = {
+    "FILL_MISSING":    "FILL_MISSING",
+    "STANDARDIZE_COL": "STANDARDIZE_COL",
+    "STANDARDIZE":     "STANDARDIZE_COL",
+    "SET_VALUE":       "SET_VALUE",
+    "DROP_ROW":        "DROP_ROW",
+    "DROP":            "DROP_ROW",
+}
 
-VALID_COMMANDS = {"SET_VALUE", "DROP_ROW", "STANDARDIZE_COL", "FILL_MISSING", "DONE"}
 VALID_STRATEGIES = {"mean", "median", "mode", "drop"}
 
 
-def parse_action(llm_output: str) -> CleanAction:
-    """
-    Parse the LLM's JSON output into a CleanAction.
-    Falls back to STANDARDIZE_COL on the first column if parsing fails.
-    """
-    text = llm_output.strip()
+def parse_action(raw: str, valid_columns: List[str]) -> CleanAction:
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        inner = lines[1:-1] if lines[-1].strip().startswith("```") else lines[1:]
+        text  = "\n".join(inner).strip()
 
-    # Strip accidental markdown fences
-    text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"```$", "", text).strip()
+    m = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+    if not m:
+        return CleanAction(command="DONE")
 
-    # Extract first JSON object
-    match = re.search(r"\{.*?\}", text, re.DOTALL)
-    if not match:
-        raise ValueError(f"No JSON object found in LLM output: {text!r}")
+    try:
+        data: Dict[str, Any] = json.loads(m.group())
+    except json.JSONDecodeError:
+        return CleanAction(command="DONE")
 
-    data = json.loads(match.group())
-    command = data.get("command", "").upper()
+    action_raw = str(data.get("action", "DONE")).strip().upper().replace(" ", "_")
 
-    if command not in VALID_COMMANDS:
-        raise ValueError(f"Unknown command: {command!r}")
+    if action_raw == "DONE":
+        return CleanAction(command="DONE")
 
-    if command == "SET_VALUE":
+    command = COMMAND_MAP.get(action_raw)
+    if command is None:
+        return CleanAction(command="DONE")
+
+    # Validate column name (case-sensitive, with case-insensitive fallback)
+    column = data.get("column")
+    if column is not None and valid_columns:
+        if column not in valid_columns:
+            col_lower = {c.lower(): c for c in valid_columns}
+            column = col_lower.get(str(column).lower())  # None if no match
+
+    # strategy → fill_strategy
+    fill_strategy = data.get("strategy") or data.get("fill_strategy")
+    if fill_strategy and str(fill_strategy).lower() not in VALID_STRATEGIES:
+        fill_strategy = "median"
+
+    # row → row_index
+    row_raw = data.get("row") if data.get("row") is not None else data.get("row_index")
+    row_index = None
+    if row_raw is not None:
+        try:
+            row_index = int(row_raw)
+        except (TypeError, ValueError):
+            pass
+
+    value = data.get("value")
+
+    try:
         return CleanAction(
-            command="SET_VALUE",
-            row_index=int(data["row_index"]),
-            column=str(data["column"]),
-            value=str(data["value"]),
+            command       = command,
+            column        = column,
+            fill_strategy = fill_strategy,
+            row_index     = row_index,
+            value         = str(value) if value is not None else None,
         )
-    elif command == "DROP_ROW":
-        return CleanAction(command="DROP_ROW", row_index=int(data["row_index"]))
-    elif command == "STANDARDIZE_COL":
-        return CleanAction(command="STANDARDIZE_COL", column=str(data["column"]))
-    elif command == "FILL_MISSING":
-        strategy = str(data.get("fill_strategy", "median")).lower()
-        if strategy not in VALID_STRATEGIES:
-            strategy = "median"
-        return CleanAction(
-            command="FILL_MISSING",
-            column=str(data["column"]),
-            fill_strategy=strategy,
-        )
-    else:  # DONE
+    except Exception:
         return CleanAction(command="DONE")
 
 
-def _action_to_str(action: CleanAction) -> str:
-    """Compact single-line string for [STEP] log."""
-    parts = [action.command]
-    if action.row_index is not None:
-        parts.append(f"row={action.row_index}")
-    if action.column:
-        parts.append(f"col={action.column}")
-    if action.value is not None:
-        val_repr = str(action.value)[:30]
-        parts.append(f"val={val_repr!r}")
-    if action.fill_strategy:
-        parts.append(f"strategy={action.fill_strategy}")
-    return "(" + ",".join(parts) + ")"
+def call_llm(client: OpenAI, messages: list) -> str:
+    response = client.chat.completions.create(
+        model       = MODEL_NAME,
+        messages    = messages,
+        max_tokens  = 100,
+        temperature = 0.0,
+    )
+    return (response.choices[0].message.content or "").strip()
 
-# ── LLM call ──────────────────────────────────────────────────────────────────
 
-def get_model_action(client: OpenAI, obs, history: List[str]) -> CleanAction:
-    user_prompt = build_user_prompt(obs, history)
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_prompt},
-            ],
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            stream=False,
-        )
-        text = (completion.choices[0].message.content or "").strip()
-        return parse_action(text)
-    except Exception as exc:
-        print(f"[DEBUG] Model/parse error: {exc}", flush=True)
-        return CleanAction(command="FILL_MISSING", column="quantity", fill_strategy="median")
+# ── Episode runner ─────────────────────────────────────────────────────────────
 
-# ── Episode runner ────────────────────────────────────────────────────────────
-
-async def run_episode(env: DataCleaningEnv, client: OpenAI, task_id: str) -> dict:
-    """
-    Run a single episode for task_id. Returns a summary dict.
-    """
-    cfg        = TASK_CONFIG[task_id]
-    max_steps  = cfg["max_steps"]
-    threshold  = cfg["threshold"]
-
-    rewards:      List[float] = []
-    history:      List[str]   = []   # action history fed back to LLM each step
-    steps_taken:  int         = 0
-    score:        float       = 0.0
-    prev_score:   float       = 0.0
-    success:      bool        = False
+async def run_episode(env, client: OpenAI, task_id: str) -> dict:
+    max_steps        = STEP_LIMITS[task_id]
+    threshold        = DONE_THRESHOLD[task_id]
+    rewards: List[float] = []
+    steps_taken      = 0
+    score            = 0.0
+    success          = False
+    history: List[str] = []
 
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        result    = await env.reset(task_id=task_id)
-        obs       = result.observation
-        prev_score = obs.current_score
+        result = await env.reset(task_id=task_id)
+        obs    = result.observation
+
+        valid_columns: List[str] = list(getattr(obs, "column_status", {}).keys())
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
         for step in range(1, max_steps + 1):
-            if result.done:
+            if obs.done:
                 break
 
-            action = get_model_action(client, obs, history)
+            steps_taken = step
+            messages.append({"role": "user", "content": build_user_prompt(obs, history)})
+
+            try:
+                raw    = call_llm(client, messages)
+                action = parse_action(raw, valid_columns)
+                messages.append({"role": "assistant", "content": raw})
+            except Exception as exc:
+                log_step(step, "DONE", 0.00, True, str(exc)[:120])
+                rewards.append(0.0)
+                break
+
+            # Keep system + last 10 turns inside free-tier context limit
+            if len(messages) > 21:
+                messages = [messages[0]] + messages[-20:]
 
             result = await env.step(action)
             obs    = result.observation
 
-            reward      = result.reward or 0.0
-            done        = result.done
-            error       = obs.last_action_error if not obs.last_action_success else None
-            score_delta = obs.current_score - prev_score
-            prev_score  = obs.current_score
+            if getattr(obs, "column_status", {}):
+                valid_columns = list(obs.column_status.keys())
 
+            reward = result.reward or 0.0
             rewards.append(reward)
-            steps_taken = step
-
-            # Build a rich history entry the LLM can learn from
-            action_desc = _action_to_str(action)
-            status      = "✓" if obs.last_action_success else "✗"
-            delta_str   = f"+{score_delta:.4f}" if score_delta > 0 else f"{score_delta:.4f}"
-            history.append(
-                f"step={step} {status} {action_desc} reward={reward:+.2f} "
-                f"score_delta={delta_str} score={obs.current_score:.4f}"
-                + (f" ERROR={error}" if error else "")
-            )
+            score  = obs.current_score
 
             log_step(
-                step=step,
-                action=action_desc,
-                reward=reward,
-                done=done,
-                error=error,
+                step   = step,
+                action = action.command,
+                reward = reward,
+                done   = obs.done,
+                error  = obs.last_action_error,
             )
 
-            if done:
+            parts = [f"step {step}: {action.command}"]
+            if action.column:       parts.append(f"col={action.column}")
+            if action.fill_strategy: parts.append(f"strategy={action.fill_strategy}")
+            parts.append(f"score={score:.4f}")
+            if obs.last_action_error:
+                parts.append(f"[BLOCKED: {obs.last_action_error[:60]}]")
+            history.append("  ".join(parts))
+
+            if obs.done or score >= threshold:
                 break
 
-        score   = obs.current_score if obs else 0.0
         success = score >= threshold
 
-    finally:
-        score   = score if score else 0.0
-        success = success if success else False
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+    except Exception as episode_err:
+        # Catch-all so [END] is always emitted even if the episode crashes
+        print(f"[DEBUG] Episode error: {episode_err}", flush=True)
+        log_end(success=False, steps=steps_taken, score=score, rewards=rewards)
+        return {"task_id": task_id, "score": score, "reward": sum(rewards),
+                "steps": steps_taken, "success": False}
 
-    return {
-        "task":    task_id,
-        "score":   score,
-        "reward":  sum(rewards),
-        "steps":   steps_taken,
-        "success": success,
-    }
+    log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+    return {"task_id": task_id, "score": score, "reward": sum(rewards),
+            "steps": steps_taken, "success": success}
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    print(f"API_BASE_URL     : {API_BASE_URL}")
-    print(f"MODEL_NAME       : {MODEL_NAME}")
-    print(f"LOCAL_IMAGE_NAME : {LOCAL_IMAGE_NAME}")
-    print()
+    if not HF_TOKEN:
+        print(
+            "ERROR: HF_TOKEN is not set.\n"
+            "1. Go to https://huggingface.co/settings/tokens\n"
+            "2. Create a Read token and copy it\n"
+            "3. Set it:  $env:HF_TOKEN='hf_xxxxxxxxxxxx'  (PowerShell)\n"
+            "            export HF_TOKEN='hf_xxxxxxxxxxxx'  (bash)\n"
+            "4. Run:     python inference.py",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    print(f"API_BASE_URL : {API_BASE_URL}", flush=True)
+    print(f"MODEL_NAME   : {MODEL_NAME}",   flush=True)
+    print(f"ENV_BASE_URL : {ENV_BASE_URL}", flush=True)
+    print("", flush=True)
 
-    if os.getenv("SPACE_ID"):   # Running inside HF Space
-        env = DataCleaningEnv(base_url="http://localhost:7860")
-        await env.connect()
-    else:
-        env = await DataCleaningEnv.from_docker_image(LOCAL_IMAGE_NAME)
+    llm = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+
+    # Always connect via URL — no Docker on the evaluator machine
+    env = DataCleaningEnv(base_url=ENV_BASE_URL)
+    await env.connect()
 
     results = []
     try:
-        for task_id in ("easy", "medium", "hard"):
-            summary = await run_episode(env, client, task_id)
+        for task_id in TASK_IDS:
+            summary = await run_episode(env, llm, task_id)
             results.append(summary)
-            print()  # blank line between tasks
+            print("", flush=True)
     finally:
         try:
             await env.close()
-        except Exception as e:
-            print(f"[DEBUG] env.close() error: {e}", flush=True)
+        except Exception:
+            pass
 
-    # ── Summary table ────────────────────────────────────────────────────────
-    print("═" * 56)
-    print(f"{'Task':<12} {'Score':>7}  {'Reward':>7}  {'Steps':>5}  {'Pass'}")
-    print("─" * 56)
+    print("=" * 56, flush=True)
+    print(f"{'Task':<10} {'Score':>7} {'Reward':>9} {'Steps':>6} {'Pass':>5}")
+    print("-" * 56, flush=True)
     for r in results:
-        flag = "YES" if r["success"] else " NO"
-        print(f"{r['task']:<12} {r['score']:>7.4f}  {r['reward']:>7.4f}  {r['steps']:>5}  {flag}")
-    print("═" * 56)
+        print(
+            f"{r['task_id']:<10} {r['score']:>7.4f} {r['reward']:>9.4f} "
+            f"{r['steps']:>6}  {'YES' if r['success'] else 'NO':>4}",
+            flush=True,
+        )
+    print("=" * 56, flush=True)
 
 
 if __name__ == "__main__":
